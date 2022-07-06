@@ -1,31 +1,32 @@
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index b161ef8a902e..ef4523874eb7 100644
+index c46f3a63b..f2aa3afc1 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -387,6 +387,11 @@ struct sched_entity {
+@@ -545,6 +545,11 @@ struct sched_entity {
  	u64				vruntime;
  	u64				prev_sum_exec_runtime;
  
 +	u32				tense_faster;
 +	u32				tense_slower;
-+	u64				tense_offcpu_duration;
-+	int 				tense_slot;
++	u64				tense_offset_duration;
++	int				tense_slot;
 +
  	u64				nr_migrations;
  
- 	struct sched_statistics		statistics;
-@@ -1100,6 +1105,8 @@ struct task_struct {
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+@@ -1460,6 +1465,9 @@ struct task_struct {
+ 	/* Used by LSM modules for access restriction: */
  	void				*security;
  #endif
- 
++
 +	struct tense_task		*tense_task;
 +
- 	/*
- 	 * New fields for task_struct should be added above here, so that
- 	 * they are included in the randomized portion of task_struct.
+ #ifdef CONFIG_BPF_SYSCALL
+ 	/* Used by BPF task local storage */
+ 	struct bpf_local_storage __rcu	*bpf_storage;
 diff --git a/include/linux/sched/tense.h b/include/linux/sched/tense.h
 new file mode 100644
-index 000000000000..ed0a349a9585
+index 000000000..0aec5eeac
 --- /dev/null
 +++ b/include/linux/sched/tense.h
 @@ -0,0 +1,44 @@
@@ -52,12 +53,12 @@ index 000000000000..ed0a349a9585
 +
 +	u64			wakeup_time;
 +	struct hrtimer		wakeup_timer;
-+	
++
 +	u32			faster;
 +	u32			slower;
 +
 +	u64			next_io_duration;
-+	
++
 +	struct list_head	list;
 +};
 +
@@ -73,123 +74,61 @@ index 000000000000..ed0a349a9585
 +void tense_resched_curr(struct task_struct *p);
 +
 +#endif /* _LINUX_SCHED_TENSE_H */
-\ No newline at end of file
 diff --git a/init/init_task.c b/init/init_task.c
-index 3ac6e754cf64..de734c704baf 100644
+index 73cc8f035..03adf2a47 100644
 --- a/init/init_task.c
 +++ b/init/init_task.c
-@@ -175,6 +175,7 @@ struct task_struct init_task
+@@ -206,6 +206,7 @@ struct task_struct init_task
  #ifdef CONFIG_SECURITY
  	.security	= NULL,
  #endif
 +	.tense_task	= NULL,
- };
- EXPORT_SYMBOL(init_task);
- 
+ #ifdef CONFIG_SECCOMP_FILTER
+ 	.seccomp	= { .filter_count = ATOMIC_INIT(0) },
+ #endif
 diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
-index e2f9d4feff40..f788165f27fe 100644
+index 976092b7b..186ea4e11 100644
 --- a/kernel/sched/Makefile
 +++ b/kernel/sched/Makefile
-@@ -16,7 +16,7 @@ ifneq ($(CONFIG_SCHED_OMIT_FRAME_POINTER),y)
- CFLAGS_core.o := $(PROFILING) -fno-omit-frame-pointer
- endif
- 
--obj-y += core.o loadavg.o clock.o cputime.o
-+obj-y += core.o loadavg.o clock.o cputime.o tense.o
- obj-y += idle_task.o fair.o rt.o deadline.o
- obj-y += wait.o wait_bit.o swait.o completion.o idle.o
- obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o
+@@ -32,3 +32,4 @@ obj-y += core.o
+ obj-y += fair.o
+ obj-y += build_policy.o
+ obj-y += build_utility.o
++obj-y += tense.o
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index c94895bc5a2c..4f240a0903b9 100644
+index da0bf6fe9..750ef3c31 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -7,6 +7,8 @@
-  */
- #include <linux/sched.h>
- #include <linux/sched/clock.h>
+@@ -36,6 +36,7 @@
+ #include <linux/sched/nohz.h>
+ #include <linux/sched/rseq_api.h>
+ #include <linux/sched/rt.h>
 +#include <linux/sched/tense.h>
-+
- #include <uapi/linux/sched/types.h>
- #include <linux/sched/loadavg.h>
- #include <linux/sched/hotplug.h>
-@@ -3090,6 +3092,8 @@ void scheduler_tick(void)
+ 
+ #include <linux/blkdev.h>
+ #include <linux/context_tracking.h>
+@@ -5422,6 +5423,8 @@ void scheduler_tick(void)
  
  	rq_unlock(rq, &rf);
  
 +	tense->after_task_tick(curr);
 +
- 	perf_event_task_tick();
+ 	if (sched_feat(LATENCY_WARN) && resched_latency)
+ 		resched_latency_warn(cpu, resched_latency);
  
- #ifdef CONFIG_SMP
-@@ -3212,6 +3216,22 @@ static inline unsigned long get_preempt_disable_ip(struct task_struct *p)
- #endif
- }
- 
-+static void put_prev_task_fake(struct rq *rq, struct task_struct *prev)
-+{
-+}
-+
-+static const struct sched_class fake_sched_class = {
-+	.put_prev_task = put_prev_task_fake,
-+};
-+
-+static struct task_struct fake_task = {
-+	/*
-+	 * Avoid pull_{rt,dl}_task()
-+	 */
-+	.prio = MAX_PRIO + 1,
-+	.sched_class = &fake_sched_class,
-+};
-+
- /*
-  * Print scheduling while atomic bug:
-  */
-@@ -3411,7 +3431,9 @@ static void __sched notrace __schedule(bool preempt)
- 		switch_count = &prev->nvcsw;
- 	}
- 
-+	// Pick next task
- 	next = pick_next_task(rq, prev, &rf);
-+
- 	clear_tsk_need_resched(prev);
- 	clear_preempt_need_resched();
- 
-@@ -5527,22 +5549,6 @@ static void calc_load_migrate(struct rq *rq)
- 		atomic_long_add(delta, &calc_load_tasks);
- }
- 
--static void put_prev_task_fake(struct rq *rq, struct task_struct *prev)
--{
--}
--
--static const struct sched_class fake_sched_class = {
--	.put_prev_task = put_prev_task_fake,
--};
--
--static struct task_struct fake_task = {
--	/*
--	 * Avoid pull_{rt,dl}_task()
--	 */
--	.prio = MAX_PRIO + 1,
--	.sched_class = &fake_sched_class,
--};
--
- /*
-  * Migrate all tasks from the rq, sleeping tasks will be migrated by
-  * try_to_wake_up()->select_task_rq().
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index 5eb3ffc9be84..12408b058cd6 100644
+index 77b2048a9..f5907ce5f 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -23,6 +23,7 @@
- 
- #include <linux/sched/mm.h>
- #include <linux/sched/topology.h>
+@@ -37,6 +37,7 @@
+ #include <linux/sched/cputime.h>
+ #include <linux/sched/isolation.h>
+ #include <linux/sched/nohz.h>
 +#include <linux/sched/tense.h>
  
- #include <linux/latencytop.h>
- #include <linux/cpumask.h>
-@@ -837,6 +838,11 @@ static void update_curr(struct cfs_rq *cfs_rq)
+ #include <linux/cpuidle.h>
+ #include <linux/interrupt.h>
+@@ -911,6 +912,12 @@ static void update_curr(struct cfs_rq *cfs_rq)
  	curr->sum_exec_runtime += delta_exec;
  	schedstat_add(cfs_rq->exec_clock, delta_exec);
  
@@ -198,28 +137,13 @@ index 5eb3ffc9be84..12408b058cd6 100644
 +	if (entity_is_task(curr)) {
 +		delta_exec = tense->update_curr(delta_exec);
 +	}
++
  	curr->vruntime += calc_delta_fair(delta_exec, curr);
  	update_min_vruntime(cfs_rq);
  
-@@ -5163,6 +5169,7 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
- 				resched_curr(rq);
- 			return;
- 		}
-+
- 		hrtick_start(rq, delta);
- 	}
- }
-@@ -6725,6 +6732,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
- 	}
- 
- 	goto done;
-+
- simple:
- #endif
- 
 diff --git a/kernel/sched/tense.c b/kernel/sched/tense.c
 new file mode 100644
-index 000000000000..1dd39d2f6619
+index 000000000..1dd39d2f6
 --- /dev/null
 +++ b/kernel/sched/tense.c
 @@ -0,0 +1,30 @@

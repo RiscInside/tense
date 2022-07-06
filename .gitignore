@@ -10,7 +10,7 @@ obj/
 cmake-build-debug/
 
 Module.symvers
-*.mod.c
+*.mod*
 *.o.*
 *.order
 *.ko

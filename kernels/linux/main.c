@@ -92,9 +92,9 @@ static u64 tense_current_time (void);
 	current->start_time, \
 	current->se.sum_exec_runtime, \
 	current->se.vruntime, \
-	current->se.statistics.sum_sleep_runtime, \
-	current->se.statistics.wait_sum, \
-	current->se.statistics.iowait_sum)
+	current->stats.sum_sleep_runtime, \
+	current->stats.wait_sum, \
+	current->stats.iowait_sum)
 
 /* SECTION Tense single-core implementation */
 
@@ -333,9 +333,9 @@ static void wake_up_sleepers(void)
 		if (task->wakeup_time < tense_time
 			&& hrtimer_try_to_cancel(&task->wakeup_timer) == 1) {
 
-			tense_log(2, "[%llu] forced wake up %s(%d) %li expected %llu",
+			tense_log(2, "[%llu] forced wake up %s(%d) %ui expected %llu",
 				tense_time, task->task_struct->comm,
-				task->task_struct->pid, task->task_struct->state,
+				task->task_struct->pid, READ_ONCE(task->task_struct->__state),
 				task->wakeup_time);
 
 			WARN_ON(tense_time - task->wakeup_time > 10 * latency);
@@ -375,7 +375,7 @@ ssize_t
 read_tense(struct file *filp, char __user *buff, size_t count, loff_t *offp)
 {
 	struct timespec64 kernel_tp;
-	struct timespec *tp = (struct timespec *) buff;
+	struct __kernel_timespec *tp = (struct __kernel_timespec *) buff;
 
 	kernel_tp = ns_to_timespec64(tense_current_time());
 	
@@ -482,7 +482,7 @@ tense_init(void)
 {
 	init();
 	
-	debugfs_file = debugfs_create_file_unsafe(TENSE_NAME, 0666,
+	debugfs_file = debugfs_create_file(TENSE_NAME, 0666,
 		NULL, /* place it in root of debugfs */
 		NULL, /* private data is setup on open */
 		&tense_fops);
